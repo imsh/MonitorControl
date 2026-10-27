@@ -1,0 +1,63 @@
+name: Build
+
+# Builds and tests on every push to main and every pull request, and uploads the MSI and a portable zip
+# as workflow artifacts. release.yml reuses this workflow (workflow_call).
+# The version comes from Nerdbank.GitVersioning (version.json + git height), e.g. 1.0.5.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+    outputs:
+      version:
+        description: Version computed by Nerdbank.GitVersioning (major.minor.height)
+        value: ${{ jobs.build.outputs.version }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2025-vs2026
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout (full history for git height)
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up MSBuild
+        uses: microsoft/setup-msbuild@v3
+
+      - name: Compute version
+        id: version
+        shell: pwsh
+        run: |
+          dotnet tool install --global nbgv --version 3.10.94
+          $version = nbgv get-version --variable SimpleVersion
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Build
+        shell: pwsh
+        run: msbuild MonitorControl.slnx -restore -p:RestorePackagesConfig=true -p:Configuration=Release -p:Platform=x64 -m -nologo
+
+      - name: Test
+        shell: pwsh
+        run: bin\x64\Release\Tests.exe
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $version = '${{ steps.version.outputs.version }}'
+          New-Item -ItemType Directory -Force artifacts | Out-Null
+          Copy-Item bin\x64\Release\MonitorControl.msi "artifacts\MonitorControl-$version-x64.msi"
+          Compress-Archive -Path bin\x64\Release\MonitorControl.exe, LICENSE -DestinationPath "artifacts\MonitorControl-$version-x64-portable.zip"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: MonitorControl-${{ steps.version.outputs.version }}
+          path: artifacts/*
+          if-no-files-found: error

@@ -1,0 +1,37 @@
+name: Release
+
+# Manually triggered (Actions -> Release -> Run workflow, on main): builds and tests via build.yml,
+# then publishes a GitHub release tagged v<major.minor.height> with the MSI and the portable zip.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    if: github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/build.yml
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: MonitorControl-${{ needs.build.outputs.version }}
+          path: artifacts
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          gh release create "v$VERSION" artifacts/* \
+            --repo "${{ github.repository }}" \
+            --target "${{ github.sha }}" \
+            --title "Monitor Control $VERSION" \
+            --generate-notes

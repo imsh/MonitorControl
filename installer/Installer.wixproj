@@ -1,0 +1,20 @@
+<Project Sdk="WixToolset.Sdk/7.0.0">
+  <PropertyGroup>
+    <OutputName>MonitorControl</OutputName>
+    <InstallerPlatform>x64</InstallerPlatform>
+    <OutputPath>..\bin\$(Platform)\$(Configuration)\</OutputPath>
+    <IntermediateOutputPath>..\obj\Installer\$(Platform)\$(Configuration)\</IntermediateOutputPath>
+    <!-- WiX v7 requires accepting the Open Source Maintenance Fee EULA: https://wixtoolset.org/osmf/ -->
+    <AcceptEula>wix7</AcceptEula>
+    <!-- ICE61: AllowSameVersionUpgrades is intentional (MSI ignores the 4th version field).
+         ICE91: the package is per-user only, so per-machine profile copying never applies. -->
+    <SuppressIces>ICE61;ICE91</SuppressIces>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="WixToolset.UI.wixext" Version="7.0.0" />
+    <PackageReference Include="WixToolset.Util.wixext" Version="7.0.0" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\MonitorControl.vcxproj" />
+  </ItemGroup>
+</Project>

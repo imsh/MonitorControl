@@ -1,0 +1,18 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+  </Configurations>
+  <Folder Name="/Solution Items/">
+    <File Path=".gitignore" />
+    <File Path="LICENSE" />
+    <File Path="README.md" />
+    <File Path="version.json" />
+  </Folder>
+  <Folder Name="/Solution Items/.github/workflows/">
+    <File Path=".github/workflows/build.yml" />
+    <File Path=".github/workflows/release.yml" />
+  </Folder>
+  <Project Path="MonitorControl.vcxproj" />
+  <Project Path="installer/Installer.wixproj" Type="B7DD6F7E-DEF8-4E67-B5B7-07EF123DB6F0" />
+  <Project Path="Tests.vcxproj" />
+</Solution>

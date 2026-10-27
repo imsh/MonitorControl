@@ -1,0 +1,6 @@
+#include <windows.h>
+#include "resource.h"
+
+IDI_APP ICON "app.ico"
+
+// VS_VERSION_INFO is generated at build time by Nerdbank.GitVersioning.

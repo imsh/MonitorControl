@@ -1,0 +1,59 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+  <!-- Per-user install (no UAC) into %LOCALAPPDATA%\Programs\MonitorControl. -->
+  <Package Name="Monitor Control"
+           Manufacturer="MonitorControl contributors"
+           Version="!(bind.FileVersion.AppExe)"
+           UpgradeCode="{93135F45-27BD-48B8-A8C9-58FAD11681A0}"
+           Scope="perUser">
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="AppIcon" SourceFile="..\res\app.ico" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon" />
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="UserProgramsFolder" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="MonitorControl" />
+      </Directory>
+    </StandardDirectory>
+
+    <!-- Close a running instance (WM_CLOSE to its hidden window) before files are replaced or removed. -->
+    <util:CloseApplication Id="CloseApp" Target="MonitorControl.exe" CloseMessage="yes" RebootPrompt="no" />
+
+    <Feature Id="Main">
+      <!-- Shortcut and Run value live with the exe they reference (ICE69); per-user components
+           with shortcuts need an HKCU KeyPath (ICE43/ICE57). -->
+      <Component Id="App" Directory="INSTALLFOLDER" Guid="{C4A87571-4259-42C7-ACBD-338C05488CD0}">
+        <RegistryValue Root="HKCU" Key="Software\MonitorControl\Installer" Name="Installed" Type="integer" Value="1" KeyPath="yes" />
+        <File Id="AppExe" Source="$(MonitorControl.TargetPath)">
+          <Shortcut Id="AppShortcut" Directory="ProgramMenuFolder" Name="Monitor Control"
+                    WorkingDirectory="INSTALLFOLDER" Icon="AppIcon" Advertise="no" />
+        </File>
+        <!-- Same format as Settings.cpp StartupCommand(), so the tray menu shows "Start with Windows" checked. -->
+        <RegistryValue Root="HKCU" Key="Software\Microsoft\Windows\CurrentVersion\Run" Name="MonitorControl"
+                       Type="string" Value="&quot;[#AppExe]&quot;" />
+        <!-- Per-user folders must be removed explicitly (ICE64); "Programs" only if empty. -->
+        <RemoveFolder Id="RemoveInstallFolder" Directory="INSTALLFOLDER" On="uninstall" />
+        <RemoveFolder Id="RemoveUserProgramsFolder" Directory="UserProgramsFolder" On="uninstall" />
+        <!-- App settings go away with the app. -->
+        <RemoveRegistryKey Root="HKCU" Key="Software\MonitorControl" Action="removeOnUninstall" />
+      </Component>
+    </Feature>
+
+    <!-- UI: license + install, then an optional "Launch" checkbox on the finish page. -->
+    <WixVariable Id="WixUILicenseRtf" Value="License.rtf" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Launch Monitor Control" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
+    <Property Id="WixShellExecTarget" Value="[#AppExe]" />
+    <CustomAction Id="LaunchApplication" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)" DllEntry="WixShellExec" Impersonate="yes" />
+
+    <ui:WixUI Id="WixUI_Minimal" />
+    <UI>
+      <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" Value="LaunchApplication"
+               Condition="WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 and NOT Installed" />
+    </UI>
+  </Package>
+</Wix>
