@@ -3,6 +3,9 @@
 #include <algorithm>
 #include <cstdint>
 
+constexpr uint8_t kVcpBrightness = 0x10;
+constexpr uint8_t kVcpContrast = 0x12;
+
 // Monitors report each VCP feature as 0..max (max is usually 100, but not always); the UI works in percent.
 
 constexpr uint32_t PercentToRaw(int percent, uint32_t max)

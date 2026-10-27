@@ -37,9 +37,11 @@
   </ItemDefinitionGroup>
   <!-- Only the pure logic: nothing here talks to a monitor. -->
   <ItemGroup>
+    <ClCompile Include="src\CommandLine.cpp" />
     <ClCompile Include="tests\tests.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="src\CommandLine.h" />
     <ClInclude Include="src\PendingWrites.h" />
     <ClInclude Include="src\VcpMath.h" />
   </ItemGroup>

@@ -60,6 +60,20 @@ void DdcWorker::Set(uint64_t generation, size_t monitor, BYTE code, int percent)
     wake_.notify_one();
 }
 
+CommandResult DdcWorker::RunCommand(const Command& command)
+{
+    std::future<CommandResult> result;
+    {
+        std::scoped_lock lock(mutex_);
+        if (stop_)
+            return { .exitCode = 1, .output = L"Monitor Control is shutting down.\r\n" };
+        commands_.push_back({ .command = command });
+        result = commands_.back().result.get_future();
+    }
+    wake_.notify_one();
+    return result.get();
+}
+
 void DdcWorker::Run()
 {
     for (;;)
@@ -67,14 +81,18 @@ void DdcWorker::Run()
         bool enumerate = false;
         bool read = false;
         PendingWrites::Map writes;
+        std::vector<QueuedCommand> commands;
         {
             std::unique_lock lock(mutex_);
-            wake_.wait(lock, [this] { return stop_ || enumerate_ || read_ || !pending_.Empty(); });
+            wake_.wait(lock, [this] {
+                return stop_ || enumerate_ || read_ || !pending_.Empty() || !commands_.empty();
+            });
             if (stop_)
                 break;
             enumerate = std::exchange(enumerate_, false);
             read = std::exchange(read_, false);
             writes = pending_.TakeAll();
+            commands = std::exchange(commands_, {});
         }
 
         if (enumerate)
@@ -93,8 +111,8 @@ void DdcWorker::Run()
                 ++generation_;
                 pending_.TakeAll();
             }
+            writes.clear();
             Publish();
-            continue;
         }
 
         for (const auto& [key, percent] : writes)
@@ -110,6 +128,9 @@ void DdcWorker::Run()
                 Log(L"Setting VCP " + std::to_wstring(key.code) + L" failed on " + monitor.name);
         }
 
+        for (QueuedCommand& queued : commands)
+            queued.result.set_value(::RunCommand(monitors_, queued.command));
+
         if (read)
         {
             for (DdcMonitor& monitor : monitors_)
@@ -118,8 +139,17 @@ void DdcWorker::Run()
                 if (monitor.hasContrast)
                     ReadVcp(monitor.physical, kVcpContrast, monitor.contrast);
             }
-            Publish();
         }
+        if (read || !commands.empty())
+            Publish();
+    }
+
+    {
+        // Nobody may be left waiting in RunCommand().
+        std::scoped_lock lock(mutex_);
+        for (QueuedCommand& queued : commands_)
+            queued.result.set_value({ .exitCode = 1, .output = L"Monitor Control is shutting down.\r\n" });
+        commands_.clear();
     }
     DestroyDdcMonitors(monitors_);
 }

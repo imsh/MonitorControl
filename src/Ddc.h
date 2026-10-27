@@ -5,11 +5,10 @@
 #include <string>
 #include <vector>
 
-// DDC/CI over the Monitor Configuration API (dxva2). Every call blocks for tens of milliseconds,
-// so these run on DdcWorker's thread only.
+#include "VcpMath.h"
 
-constexpr BYTE kVcpBrightness = 0x10;
-constexpr BYTE kVcpContrast = 0x12;
+// DDC/CI over the Monitor Configuration API (dxva2). Every call blocks for tens of milliseconds,
+// so these run on DdcWorker's thread (or in a command-line run, when no tray app is running).
 
 struct VcpValue
 {

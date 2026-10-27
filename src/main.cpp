@@ -3,6 +3,7 @@
 #include <commctrl.h>
 #include <shellapi.h>
 
+#include <algorithm>
 #include <cwchar>
 #include <functional>
 #include <memory>
@@ -10,6 +11,8 @@
 #include <vector>
 
 #include "../res/resource.h"
+#include "CommandLine.h"
+#include "Commands.h"
 #include "DdcWorker.h"
 #include "Flyout.h"
 #include "Log.h"
@@ -21,12 +24,19 @@ namespace
 constexpr wchar_t kAppName[] = L"MonitorControl";
 constexpr wchar_t kDisplayName[] = L"Monitor Control";
 constexpr wchar_t kWindowClass[] = L"MonitorControl.Window";
+constexpr wchar_t kReplyWindowClass[] = L"MonitorControl.Reply";
 constexpr wchar_t kInstanceMutex[] = L"Local\\MonitorControl.SingleInstance";
 
 constexpr UINT WM_TRAY_CALLBACK = WM_APP + 1;
 constexpr UINT WM_DDC_SNAPSHOT = WM_APP + 2;
 constexpr UINT kTrayIconId = 1;
 constexpr UINT kFirstMenuCommandId = 100;
+
+// WM_COPYDATA between a command-line call and the tray app: the arguments go in, the output comes
+// back to the caller's reply window, and the exit code is the message result.
+constexpr ULONG_PTR kCopyDataCommand = 0x4D43'0001;
+constexpr ULONG_PTR kCopyDataReply = 0x4D43'0002;
+constexpr UINT kForwardTimeoutMs = 15000;
 
 #ifdef _DEBUG
 constexpr wchar_t kBuildType[] = L"Debug";
@@ -97,6 +107,7 @@ private:
     void BuildMenuItems();
     void ShowMenu(POINT anchor);
     void OnSnapshot(const DdcSnapshot& snapshot);
+    LRESULT OnForwardedCommand(HWND replyWindow, const COPYDATASTRUCT& data);
 
     HINSTANCE instance_ = nullptr;
     HWND hwnd_ = nullptr;
@@ -130,6 +141,7 @@ bool App::Initialize(HINSTANCE instance)
     if (!CreateWindowExW(0, kWindowClass, kAppName, WS_OVERLAPPED, 0, 0, 0, 0, nullptr, nullptr, instance, this))
         return false;
     ChangeWindowMessageFilterEx(hwnd_, taskbarCreatedMessage_, MSGFLT_ALLOW, nullptr);
+    ChangeWindowMessageFilterEx(hwnd_, WM_COPYDATA, MSGFLT_ALLOW, nullptr);
 
     if (FAILED(LoadIconMetric(instance, MAKEINTRESOURCEW(IDI_APP), LIM_SMALL, &icon_)))
         icon_ = LoadIconW(nullptr, IDI_APPLICATION);
@@ -146,11 +158,14 @@ bool App::Initialize(HINSTANCE instance)
             static_cast<void>(payload.release());   // the window now owns it
     });
 
+    // Started before anything that could process a forwarded command, which waits for the worker.
+    // Its snapshots are posted, so they are only handled once the flyout exists.
+    worker_->Start();
+
     flyout_ = std::make_unique<Flyout>(instance, *worker_);
     if (!flyout_->Create())
         return false;
 
-    worker_->Start();
     Log(L"Started " + std::wstring(kAppName) + L" " + AppVersion() + L", " + kBuildType + L" build");
     return true;
 }
@@ -223,6 +238,34 @@ void App::OnSnapshot(const DdcSnapshot& snapshot)
     tray_->SetTooltip(tooltip);
 }
 
+// A command-line call made while the tray app runs. Running it here keeps all DDC traffic on one
+// thread, and the snapshot that follows moves the flyout's sliders.
+LRESULT App::OnForwardedCommand(HWND replyWindow, const COPYDATASTRUCT& data)
+{
+    const std::vector<std::wstring> args =
+        SplitArguments({ static_cast<const wchar_t*>(data.lpData), data.cbData / sizeof(wchar_t) });
+    std::wstring line;
+    for (const std::wstring& arg : args)
+        line += L" " + arg;
+    Log(L"Command from command line:" + line);
+
+    const ParseResult parsed = ParseCommandLine(args);
+    CommandResult result{ .exitCode = 2, .output = parsed.error + L"\r\n" };
+    if (parsed.error.empty() &&
+        (parsed.command.action == Command::Action::Apply || parsed.command.action == Command::Action::List))
+        result = worker_->RunCommand(parsed.command);
+
+    if (replyWindow && IsWindow(replyWindow) && !result.output.empty())
+    {
+        COPYDATASTRUCT reply{ .dwData = kCopyDataReply,
+                              .cbData = static_cast<DWORD>(result.output.size() * sizeof(wchar_t)),
+                              .lpData = result.output.data() };
+        SendMessageTimeoutW(replyWindow, WM_COPYDATA, reinterpret_cast<WPARAM>(hwnd_), reinterpret_cast<LPARAM>(&reply),
+                            SMTO_ABORTIFHUNG, kForwardTimeoutMs, nullptr);
+    }
+    return result.exitCode;
+}
+
 LRESULT CALLBACK App::WndProcThunk(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
     if (message == WM_NCCREATE)
@@ -272,6 +315,16 @@ LRESULT App::WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
         return 0;
     }
 
+    case WM_COPYDATA:
+    {
+        const auto* data = reinterpret_cast<const COPYDATASTRUCT*>(lParam);
+        if (!data || data->dwData != kCopyDataCommand)
+            return 2;
+        if (!worker_)
+            return 1;
+        return OnForwardedCommand(reinterpret_cast<HWND>(wParam), *data);
+    }
+
     case WM_DISPLAYCHANGE:
         // Monitors plugged in, unplugged or rearranged: the physical monitor handles are stale.
         worker_->RequestEnumerate();
@@ -305,10 +358,177 @@ LRESULT App::WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
     }
     return DefWindowProcW(hwnd, message, wParam, lParam);
 }
+
+// Writes to stdout or stderr: the console the command was typed in, or a redirect. With neither (a
+// shortcut or hotkey with arguments) only messages worth interrupting for are shown, in a box.
+void WriteOutput(const std::wstring& text, bool error, bool showWithoutConsole)
+{
+    if (text.empty())
+        return;
+
+    HANDLE out = GetStdHandle(error ? STD_ERROR_HANDLE : STD_OUTPUT_HANDLE);
+    if (out && out != INVALID_HANDLE_VALUE)
+    {
+        DWORD written = 0;
+        DWORD mode = 0;
+        if (GetConsoleMode(out, &mode))
+        {
+            if (WriteConsoleW(out, text.c_str(), static_cast<DWORD>(text.size()), &written, nullptr))
+                return;
+        }
+        else
+        {
+            const std::string utf8 = ToUtf8(text);
+            if (WriteFile(out, utf8.data(), static_cast<DWORD>(utf8.size()), &written, nullptr))
+                return;
+        }
+    }
+
+    if (showWithoutConsole)
+        MessageBoxW(nullptr, text.c_str(), kDisplayName, MB_OK | (error ? MB_ICONWARNING : MB_ICONINFORMATION));
+}
+
+// The tray app must not hold a console. Started from a terminal, the shell would wait for it to exit:
+// start a detached copy instead and give the prompt back. Returns true when that copy took over.
+bool HandOffTrayAppFromConsole()
+{
+    DWORD processes[2];
+    const DWORD count = GetConsoleProcessList(processes, 2);
+    if (count == 0)
+        return false;   // no console, the usual case
+    if (count == 1)
+    {
+        // Our own console window: Windows before 11 24H2 ignores consoleAllocationPolicy.
+        FreeConsole();
+        return false;
+    }
+
+    if (FindWindowW(kWindowClass, nullptr))
+    {
+        WriteOutput(L"Monitor Control is already running in the system tray.\r\n", false, false);
+        return true;
+    }
+
+    std::wstring path(MAX_PATH, L'\0');
+    for (;;)
+    {
+        const DWORD length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
+        if (length < path.size())
+        {
+            path.resize(length);
+            break;
+        }
+        path.resize(path.size() * 2);
+    }
+    std::wstring commandLine = L"\"" + path + L"\"";
+    STARTUPINFOW startup{ .cb = sizeof(STARTUPINFOW) };
+    PROCESS_INFORMATION process{};
+    if (!CreateProcessW(path.c_str(), commandLine.data(), nullptr, nullptr, FALSE, DETACHED_PROCESS, nullptr,
+                        nullptr, &startup, &process))
+    {
+        FreeConsole();
+        return false;   // run here, just without the console
+    }
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    WriteOutput(L"Monitor Control started in the system tray.\r\n", false, false);
+    return true;
+}
+
+LRESULT CALLBACK ReplyWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    if (message == WM_NCCREATE)
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA,
+                          reinterpret_cast<LONG_PTR>(reinterpret_cast<CREATESTRUCTW*>(lParam)->lpCreateParams));
+    if (message == WM_COPYDATA)
+    {
+        const auto* data = reinterpret_cast<const COPYDATASTRUCT*>(lParam);
+        auto* output = reinterpret_cast<std::wstring*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        if (data && output && data->dwData == kCopyDataReply)
+            output->assign(static_cast<const wchar_t*>(data->lpData), data->cbData / sizeof(wchar_t));
+        return TRUE;
+    }
+    return DefWindowProcW(hwnd, message, wParam, lParam);
+}
+
+// Hands the command to the running tray app. Returns false if there is none (or it went away).
+bool ForwardToTrayApp(HINSTANCE instance, const std::vector<std::wstring>& args, CommandResult& result)
+{
+    HWND app = FindWindowW(kWindowClass, nullptr);
+    if (!app)
+        return false;
+
+    WNDCLASSEXW windowClass{};
+    windowClass.cbSize = sizeof(windowClass);
+    windowClass.lpfnWndProc = ReplyWndProc;
+    windowClass.hInstance = instance;
+    windowClass.lpszClassName = kReplyWindowClass;
+    RegisterClassExW(&windowClass);
+    HWND reply = CreateWindowExW(0, kReplyWindowClass, nullptr, 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, instance,
+                                 &result.output);
+
+    std::wstring joined = JoinArguments(args);
+    COPYDATASTRUCT data{ .dwData = kCopyDataCommand,
+                         .cbData = static_cast<DWORD>(joined.size() * sizeof(wchar_t)),
+                         .lpData = joined.data() };
+    DWORD_PTR exitCode = 0;
+    const bool sent = SendMessageTimeoutW(app, WM_COPYDATA, reinterpret_cast<WPARAM>(reply),
+                                          reinterpret_cast<LPARAM>(&data), SMTO_ABORTIFHUNG, kForwardTimeoutMs,
+                                          &exitCode) != 0;
+    if (reply)
+        DestroyWindow(reply);
+    if (!sent)
+    {
+        if (!IsWindow(app))
+            return false;   // it exited meanwhile: do it ourselves
+        result = { .exitCode = 1, .output = L"Monitor Control in the tray did not respond.\r\n" };
+        return true;
+    }
+    result.exitCode = static_cast<int>(exitCode);
+    return true;
+}
+
+int RunCliCommand(HINSTANCE instance, const std::vector<std::wstring>& args, const Command& command)
+{
+    CommandResult result;
+    if (!ForwardToTrayApp(instance, args, result))
+    {
+        std::vector<DdcMonitor> monitors = EnumerateDdcMonitors();
+        result = RunCommand(monitors, command);
+        DestroyDdcMonitors(monitors);
+    }
+    // A successful change from a hotkey or shortcut should stay silent.
+    const bool failed = result.exitCode != 0;
+    WriteOutput(result.output, failed, failed || command.action == Command::Action::List);
+    return result.exitCode;
+}
 } // namespace
 
-int WINAPI wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
+int wmain(int argc, wchar_t* argv[])
 {
+    HINSTANCE instance = GetModuleHandleW(nullptr);
+    const std::vector<std::wstring> args(argv + std::min(argc, 1), argv + argc);
+    const ParseResult parsed = ParseCommandLine(args);
+    if (!parsed.error.empty())
+    {
+        WriteOutput(parsed.error + L"\r\n\r\n" + UsageText(), true, true);
+        return 2;
+    }
+    switch (parsed.command.action)
+    {
+    case Command::Action::Help:
+        WriteOutput(UsageText(), false, true);
+        return 0;
+    case Command::Action::Apply:
+    case Command::Action::List:
+        return RunCliCommand(instance, args, parsed.command);
+    case Command::Action::Tray:
+        break;
+    }
+
+    if (HandOffTrayAppFromConsole())
+        return 0;
+
     HANDLE mutex = CreateMutexW(nullptr, FALSE, kInstanceMutex);
     if (GetLastError() == ERROR_ALREADY_EXISTS)
     {

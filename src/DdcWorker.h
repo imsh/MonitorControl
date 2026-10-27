@@ -5,11 +5,13 @@
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <future>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include "Commands.h"
 #include "Ddc.h"
 #include "PendingWrites.h"
 
@@ -47,7 +49,17 @@ public:
     void RequestRead();
     void Set(uint64_t generation, size_t monitor, BYTE code, int percent);
 
+    // Runs a command-line command on the worker thread and waits for it. A snapshot follows, so the
+    // flyout shows the result.
+    CommandResult RunCommand(const Command& command);
+
 private:
+    struct QueuedCommand
+    {
+        Command command;
+        std::promise<CommandResult> result;
+    };
+
     void Run();
     void Publish() const;
 
@@ -59,6 +71,7 @@ private:
     bool read_ = false;
     uint64_t generation_ = 0;   // written by the worker thread under mutex_
     PendingWrites pending_;
+    std::vector<QueuedCommand> commands_;
     std::thread thread_;
 
     std::vector<DdcMonitor> monitors_;   // worker thread only
