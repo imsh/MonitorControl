@@ -117,6 +117,7 @@ private:
     std::unique_ptr<DdcWorker> worker_;
     std::unique_ptr<Flyout> flyout_;
     std::vector<MenuItem> menuItems_;
+    bool displayOn_ = true;
 };
 
 bool App::Initialize(HINSTANCE instance)
@@ -142,6 +143,7 @@ bool App::Initialize(HINSTANCE instance)
         return false;
     ChangeWindowMessageFilterEx(hwnd_, taskbarCreatedMessage_, MSGFLT_ALLOW, nullptr);
     ChangeWindowMessageFilterEx(hwnd_, WM_COPYDATA, MSGFLT_ALLOW, nullptr);
+    RegisterPowerSettingNotification(hwnd_, &GUID_CONSOLE_DISPLAY_STATE, DEVICE_NOTIFY_WINDOW_HANDLE);
 
     if (FAILED(LoadIconMetric(instance, MAKEINTRESOURCEW(IDI_APP), LIM_SMALL, &icon_)))
         icon_ = LoadIconW(nullptr, IDI_APPLICATION);
@@ -333,6 +335,20 @@ LRESULT App::WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
     case WM_POWERBROADCAST:
         if (wParam == PBT_APMRESUMEAUTOMATIC)
             worker_->RequestEnumerate();
+        else if (wParam == PBT_POWERSETTINGCHANGE)
+        {
+            // The display turned back on after the idle timeout: monitors that went to standby may
+            // have dropped off the bus, leaving our handles stale. No WM_DISPLAYCHANGE comes for that.
+            const auto* setting = reinterpret_cast<const POWERBROADCAST_SETTING*>(lParam);
+            // Registering sends the current state at once; only a transition to on matters.
+            if (setting && setting->PowerSetting == GUID_CONSOLE_DISPLAY_STATE && setting->DataLength == sizeof(DWORD))
+            {
+                const bool on = *reinterpret_cast<const DWORD*>(setting->Data) == 1;   // 0 off, 1 on, 2 dimmed
+                if (on && !displayOn_)
+                    worker_->RequestEnumerate();
+                displayOn_ = on || *reinterpret_cast<const DWORD*>(setting->Data) == 2;
+            }
+        }
         return TRUE;
 
     case WM_COMMAND:

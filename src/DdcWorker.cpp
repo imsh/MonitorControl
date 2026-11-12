@@ -97,35 +97,36 @@ void DdcWorker::Run()
 
         if (enumerate)
         {
-            DestroyDdcMonitors(monitors_);
-            monitors_ = EnumerateDdcMonitors();
-
-            std::wstring names;
-            for (const DdcMonitor& monitor : monitors_)
-                names += L"\n    " + monitor.name + (monitor.hasContrast ? L"" : L" (no contrast)");
-            Log(L"Found " + std::to_wstring(monitors_.size()) + L" DDC/CI monitor(s)" + names);
-
-            {
-                // Writes queued against the old list are meaningless now.
-                std::scoped_lock lock(mutex_);
-                ++generation_;
-                pending_.TakeAll();
-            }
+            Enumerate();
             writes.clear();
-            Publish();
         }
 
+        // Physical monitor handles go stale when a monitor drops off the bus and comes back (e.g. it
+        // went to standby) without Windows telling us. Enumerate again once and retry.
+        std::vector<std::pair<WriteKey, int>> failed;
         for (const auto& [key, percent] : writes)
         {
-            if (key.monitor >= monitors_.size())
-                continue;
-            DdcMonitor& monitor = monitors_[key.monitor];
-            VcpValue& value = key.code == kVcpContrast ? monitor.contrast : monitor.brightness;
-            const DWORD raw = PercentToRaw(percent, value.max);
-            if (WriteVcp(monitor.physical, key.code, raw))
-                value.current = raw;
-            else
-                Log(L"Setting VCP " + std::to_wstring(key.code) + L" failed on " + monitor.name);
+            if (!Write(key, percent))
+                failed.emplace_back(key, percent);
+        }
+        if (!failed.empty())
+        {
+            std::vector<std::wstring> oldNames;
+            for (const DdcMonitor& monitor : monitors_)
+                oldNames.push_back(monitor.name);
+            Log(L"Writing failed, enumerating the monitors again");
+            Enumerate();
+
+            for (const auto& [key, percent] : failed)
+            {
+                // Only retry if the index still points at the same monitor.
+                if (key.monitor < monitors_.size() && key.monitor < oldNames.size() &&
+                    monitors_[key.monitor].name == oldNames[key.monitor] && Write(key, percent))
+                    continue;
+                const std::wstring name = key.monitor < oldNames.size() ? oldNames[key.monitor] : L"?";
+                Log(L"Setting VCP " + std::to_wstring(key.code) + L" failed on " + name);
+            }
+            Publish();
         }
 
         for (QueuedCommand& queued : commands)
@@ -152,6 +153,38 @@ void DdcWorker::Run()
         commands_.clear();
     }
     DestroyDdcMonitors(monitors_);
+}
+
+void DdcWorker::Enumerate()
+{
+    DestroyDdcMonitors(monitors_);
+    monitors_ = EnumerateDdcMonitors();
+
+    std::wstring names;
+    for (const DdcMonitor& monitor : monitors_)
+        names += L"\n    " + monitor.name + (monitor.hasContrast ? L"" : L" (no contrast)");
+    Log(L"Found " + std::to_wstring(monitors_.size()) + L" DDC/CI monitor(s)" + names);
+
+    {
+        // Writes queued against the old list are meaningless now.
+        std::scoped_lock lock(mutex_);
+        ++generation_;
+        pending_.TakeAll();
+    }
+    Publish();
+}
+
+bool DdcWorker::Write(const WriteKey& key, int percent)
+{
+    if (key.monitor >= monitors_.size())
+        return true;   // nothing to write to
+    DdcMonitor& monitor = monitors_[key.monitor];
+    VcpValue& value = key.code == kVcpContrast ? monitor.contrast : monitor.brightness;
+    const DWORD raw = PercentToRaw(percent, value.max);
+    if (!WriteVcp(monitor.physical, key.code, raw))
+        return false;
+    value.current = raw;
+    return true;
 }
 
 void DdcWorker::Publish() const

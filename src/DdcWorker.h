@@ -61,6 +61,8 @@ private:
     };
 
     void Run();
+    void Enumerate();
+    bool Write(const WriteKey& key, int percent);   // false if the monitor refused it
     void Publish() const;
 
     SnapshotCallback onSnapshot_;
